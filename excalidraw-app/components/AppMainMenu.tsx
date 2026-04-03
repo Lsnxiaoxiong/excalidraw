@@ -2,6 +2,8 @@ import {
   loginIcon,
   ExcalLogo,
   eyeIcon,
+  file,
+  historyIcon,
 } from "@excalidraw/excalidraw/components/icons";
 import { MainMenu } from "@excalidraw/excalidraw/index";
 import React from "react";
@@ -22,11 +24,24 @@ export const AppMainMenu: React.FC<{
   theme: Theme | "system";
   setTheme: (theme: Theme | "system") => void;
   refresh: () => void;
+  onOpenLocalFile: () => void;
+  onSaveLocalFile: () => void;
+  onOpenLocalHistory: () => void;
+  hasActiveLocalFile: boolean;
 }> = React.memo((props) => {
   return (
     <MainMenu>
-      <MainMenu.DefaultItems.LoadScene />
-      <MainMenu.DefaultItems.SaveToActiveFile />
+      <MainMenu.Item icon={file} onSelect={props.onOpenLocalFile}>
+        打开本地文件
+      </MainMenu.Item>
+      <MainMenu.Item icon={historyIcon} onSelect={props.onOpenLocalHistory}>
+        历史文件
+      </MainMenu.Item>
+      {props.hasActiveLocalFile && (
+        <MainMenu.Item icon={file} onSelect={props.onSaveLocalFile}>
+          保存到当前文件
+        </MainMenu.Item>
+      )}
       <MainMenu.DefaultItems.Export />
       <MainMenu.DefaultItems.SaveAsImage />
       {props.isCollabEnabled && (

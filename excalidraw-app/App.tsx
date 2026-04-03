@@ -1,6 +1,7 @@
 import {
   Excalidraw,
   LiveCollaborationTrigger,
+  Sidebar,
   TTDDialogTrigger,
   CaptureUpdateAction,
   reconcileElements,
@@ -36,6 +37,7 @@ import {
 import polyfill from "@excalidraw/excalidraw/polyfill";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { loadFromBlob } from "@excalidraw/excalidraw/data/blob";
+import { serializeAsJSON } from "@excalidraw/excalidraw/data/json";
 import { t } from "@excalidraw/excalidraw/i18n";
 
 import {
@@ -46,6 +48,7 @@ import {
   usersIcon,
   exportToPlus,
   share,
+  sidebarRightIcon,
   youtubeIcon,
 } from "@excalidraw/excalidraw/components/icons";
 import { isElementLink } from "@excalidraw/element";
@@ -147,8 +150,19 @@ import "./index.scss";
 
 import { ExcalidrawPlusPromoBanner } from "./components/ExcalidrawPlusPromoBanner";
 import { AppSidebar } from "./components/AppSidebar";
+import { LocalFileSidebar } from "./components/LocalFileSidebar";
+
+import {
+  checkLocalFileService,
+  getLocalFileHistory,
+  openLocalFileByPath,
+  openLocalFileDialog,
+  removeLocalFileHistoryEntry,
+  saveLocalFile,
+} from "./local-files/api";
 
 import type { CollabAPI } from "./collab/Collab";
+import type { LocalFileHistoryEntry } from "./local-files/api";
 
 polyfill();
 
@@ -199,6 +213,12 @@ if (window.self !== window.top) {
     // ignore
   }
 }
+
+const getFileNameFromPath = (filePath: string) => {
+  const normalizedPath = filePath.replaceAll("\\", "/");
+  const fileName = normalizedPath.split("/").pop() || filePath;
+  return fileName.replace(/\.(excalidraw|json)$/i, "");
+};
 
 const shareableLinkConfirmDialog = {
   title: t("overwriteConfirm.modal.shareableLink.title"),
@@ -716,6 +736,40 @@ const ExcalidrawWrapper = () => {
       });
     }
 
+    if (skipNextAutosaveRef.current) {
+      skipNextAutosaveRef.current = false;
+    } else if (currentLocalFilePath) {
+      autosaveSnapshotRef.current = {
+        elements,
+        appState,
+        files,
+      };
+      if (autosaveTimerRef.current) {
+        window.clearTimeout(autosaveTimerRef.current);
+      }
+      autosaveTimerRef.current = window.setTimeout(async () => {
+        if (!autosaveSnapshotRef.current || !currentLocalFilePath) {
+          return;
+        }
+
+        setLocalFileSaveState("saving");
+        try {
+          const content = serializeAsJSON(
+            autosaveSnapshotRef.current.elements,
+            autosaveSnapshotRef.current.appState,
+            autosaveSnapshotRef.current.files,
+            "local",
+          );
+          const payload = await saveLocalFile(currentLocalFilePath, content);
+          setLocalFileHistory(payload.history);
+          setLocalFileSaveState("saved");
+          setIsLocalFileServiceAvailable(true);
+        } catch (error) {
+          setLocalFileSaveState("error");
+        }
+      }, 600);
+    }
+
     // Render the debug scene if the debug canvas is available
     if (debugCanvasRef.current && excalidrawAPI) {
       debugRenderer(
@@ -792,6 +846,207 @@ const ExcalidrawWrapper = () => {
     () => setShareDialogState({ isOpen: true, type: "collaborationOnly" }),
     [setShareDialogState],
   );
+
+  const [localFileHistory, setLocalFileHistory] = useState<
+    LocalFileHistoryEntry[]
+  >([]);
+  const [currentLocalFilePath, setCurrentLocalFilePath] = useState<
+    string | null
+  >(null);
+  const [isLocalFileServiceAvailable, setIsLocalFileServiceAvailable] =
+    useState(false);
+  const [isLocalFileBusy, setIsLocalFileBusy] = useState(false);
+  const [localFileSaveState, setLocalFileSaveState] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+
+  const autosaveTimerRef = useRef<number | null>(null);
+  const autosaveSnapshotRef = useRef<{
+    elements: readonly OrderedExcalidrawElement[];
+    appState: AppState;
+    files: BinaryFiles;
+  } | null>(null);
+  const skipNextAutosaveRef = useRef(false);
+
+  const applyLocalFileToCanvas = useCallback(
+    async (
+      payload: {
+        file: { path: string; name: string; content: string };
+        history: LocalFileHistoryEntry[];
+      },
+      successMessage: string,
+    ) => {
+      if (!excalidrawAPI) {
+        return;
+      }
+
+      const loadedScene = await loadFromBlob(
+        new Blob([payload.file.content], {
+          type: "application/json",
+        }),
+        excalidrawAPI.getAppState(),
+        excalidrawAPI.getSceneElementsIncludingDeleted(),
+      );
+
+      skipNextAutosaveRef.current = true;
+      excalidrawAPI.resetScene({ resetLoadingState: true });
+      excalidrawAPI.updateScene({
+        elements: loadedScene.elements,
+        appState: {
+          ...loadedScene.appState,
+          name:
+            loadedScene.appState.name || getFileNameFromPath(payload.file.path),
+        },
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+      });
+      excalidrawAPI.addFiles(Object.values(loadedScene.files || {}));
+      excalidrawAPI.history.clear();
+      excalidrawAPI.setToast({
+        message: successMessage,
+      });
+
+      setCurrentLocalFilePath(payload.file.path);
+      setLocalFileHistory(payload.history);
+      setLocalFileSaveState("saved");
+      setIsLocalFileServiceAvailable(true);
+    },
+    [excalidrawAPI],
+  );
+
+  const refreshLocalFileHistory = useCallback(async () => {
+    try {
+      const entries = await getLocalFileHistory();
+      setLocalFileHistory(entries);
+      setIsLocalFileServiceAvailable(true);
+    } catch (error) {
+      setIsLocalFileServiceAvailable(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkLocalFileService()
+      .then(() => refreshLocalFileHistory())
+      .catch(() => {
+        setIsLocalFileServiceAvailable(false);
+      });
+  }, [refreshLocalFileHistory]);
+
+  const openLocalFileFromDialog = useCallback(async () => {
+    setIsLocalFileBusy(true);
+    try {
+      const payload = await openLocalFileDialog();
+      if (payload.cancelled) {
+        return;
+      }
+      await applyLocalFileToCanvas(
+        payload,
+        `已打开 ${payload.file.name}，后续修改将自动保存`,
+      );
+    } catch (error: any) {
+      setIsLocalFileServiceAvailable(false);
+      excalidrawAPI?.updateScene({
+        appState: {
+          errorMessage: error.message,
+        },
+      });
+    } finally {
+      setIsLocalFileBusy(false);
+    }
+  }, [applyLocalFileToCanvas, excalidrawAPI]);
+
+  const openLocalFileFromHistory = useCallback(
+    async (filePath: string) => {
+      setIsLocalFileBusy(true);
+      try {
+        const payload = await openLocalFileByPath(filePath);
+        await applyLocalFileToCanvas(payload, `已打开 ${payload.file.name}`);
+      } catch (error: any) {
+        excalidrawAPI?.updateScene({
+          appState: {
+            errorMessage: error.message,
+          },
+        });
+      } finally {
+        setIsLocalFileBusy(false);
+      }
+    },
+    [applyLocalFileToCanvas, excalidrawAPI],
+  );
+
+  const saveCurrentLocalFile = useCallback(async () => {
+    if (!excalidrawAPI || !currentLocalFilePath) {
+      return;
+    }
+
+    setLocalFileSaveState("saving");
+    try {
+      const content = serializeAsJSON(
+        excalidrawAPI.getSceneElementsIncludingDeleted(),
+        excalidrawAPI.getAppState(),
+        excalidrawAPI.getFiles(),
+        "local",
+      );
+      const payload = await saveLocalFile(currentLocalFilePath, content);
+      setLocalFileHistory(payload.history);
+      setLocalFileSaveState("saved");
+      setIsLocalFileServiceAvailable(true);
+    } catch (error: any) {
+      setLocalFileSaveState("error");
+      excalidrawAPI.updateScene({
+        appState: {
+          errorMessage: error.message,
+        },
+      });
+    }
+  }, [currentLocalFilePath, excalidrawAPI]);
+
+  const deleteLocalFileHistoryItem = useCallback(
+    async (filePath: string) => {
+      setIsLocalFileBusy(true);
+      try {
+        const history = await removeLocalFileHistoryEntry(filePath);
+        setLocalFileHistory(history);
+      } catch (error: any) {
+        excalidrawAPI?.updateScene({
+          appState: {
+            errorMessage: error.message,
+          },
+        });
+      } finally {
+        setIsLocalFileBusy(false);
+      }
+    },
+    [excalidrawAPI],
+  );
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) {
+        return;
+      }
+
+      if (event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        void openLocalFileFromDialog();
+      }
+
+      if (event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void saveCurrentLocalFile();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openLocalFileFromDialog, saveCurrentLocalFile]);
+
+  useEffect(() => {
+    return () => {
+      if (autosaveTimerRef.current) {
+        window.clearTimeout(autosaveTimerRef.current);
+      }
+    };
+  }, []);
 
   // ---------------------------------------------------------------------------
   // onExport — intercepts file save to wait for pending image loads
@@ -916,6 +1171,8 @@ const ExcalidrawWrapper = () => {
         onPointerUpdate={collabAPI?.onPointerUpdate}
         UIOptions={{
           canvasActions: {
+            loadScene: false,
+            saveToActiveFile: false,
             toggleTheme: true,
             export: {
               onExportToBackend,
@@ -953,26 +1210,40 @@ const ExcalidrawWrapper = () => {
         autoFocus={true}
         theme={editorTheme}
         renderTopRightUI={(isMobile) => {
-          if (isMobile || !collabAPI || isCollabDisabled) {
+          if (isMobile) {
             return null;
           }
 
           return (
             <div className="excalidraw-ui-top-right">
+              <Sidebar.Trigger
+                name="localFiles"
+                icon={sidebarRightIcon}
+                title="历史文件"
+                onToggle={(isOpen) => {
+                  if (isOpen) {
+                    void refreshLocalFileHistory();
+                  }
+                }}
+              />
               {excalidrawAPI?.getEditorInterface().formFactor === "desktop" && (
                 <ExcalidrawPlusPromoBanner
                   isSignedIn={isExcalidrawPlusSignedUser}
                 />
               )}
 
-              {collabError.message && <CollabError collabError={collabError} />}
-              <LiveCollaborationTrigger
-                isCollaborating={isCollaborating}
-                onSelect={() =>
-                  setShareDialogState({ isOpen: true, type: "share" })
-                }
-                editorInterface={editorInterface}
-              />
+              {!isCollabDisabled && collabError.message && (
+                <CollabError collabError={collabError} />
+              )}
+              {!isCollabDisabled && collabAPI && (
+                <LiveCollaborationTrigger
+                  isCollaborating={isCollaborating}
+                  onSelect={() =>
+                    setShareDialogState({ isOpen: true, type: "share" })
+                  }
+                  editorInterface={editorInterface}
+                />
+              )}
             </div>
           );
         }}
@@ -990,6 +1261,16 @@ const ExcalidrawWrapper = () => {
           theme={appTheme}
           setTheme={(theme) => setAppTheme(theme)}
           refresh={() => forceRefresh((prev) => !prev)}
+          onOpenLocalFile={openLocalFileFromDialog}
+          onSaveLocalFile={saveCurrentLocalFile}
+          onOpenLocalHistory={() => {
+            void refreshLocalFileHistory();
+            void excalidrawAPI?.toggleSidebar({
+              name: "localFiles",
+              force: true,
+            });
+          }}
+          hasActiveLocalFile={!!currentLocalFilePath}
         />
         <AppWelcomeScreen
           onCollabDialogOpen={onCollabDialogOpen}
@@ -1058,6 +1339,17 @@ const ExcalidrawWrapper = () => {
         />
 
         <AppSidebar />
+        <LocalFileSidebar
+          historyEntries={localFileHistory}
+          currentFilePath={currentLocalFilePath}
+          isBackendAvailable={isLocalFileServiceAvailable}
+          isBusy={isLocalFileBusy}
+          saveState={localFileSaveState}
+          onOpenDialog={openLocalFileFromDialog}
+          onOpenHistoryFile={openLocalFileFromHistory}
+          onDeleteHistoryFile={deleteLocalFileHistoryItem}
+          onSaveNow={saveCurrentLocalFile}
+        />
 
         {errorMessage && (
           <ErrorDialog onClose={() => setErrorMessage("")}>
